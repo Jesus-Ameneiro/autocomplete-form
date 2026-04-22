@@ -678,13 +678,17 @@ uploaded_file = st.file_uploader("Upload your Word template", type=["docx"])
 if uploaded_file is not None:
     file_bytes = uploaded_file.read()
 
-    # ── Detect file change → clear all previous data ─────────────────
+    # ── Detect file change → clear unlocked data ───────────────────
     file_fingerprint = f"{uploaded_file.name}_{uploaded_file.size}"
     if st.session_state.get("_file_fp") != file_fingerprint:
         st.session_state["_file_fp"] = file_fingerprint
-        st.session_state.pop("g_vals", None)
-        st.session_state.pop("t_vals", None)
-        # Bump key counter so all input widgets get fresh instances
+        locked = st.session_state.get("locked", set())
+        # Preserve locked values, wipe everything else
+        old_g = st.session_state.get("g_vals", {})
+        old_t = st.session_state.get("t_vals", {})
+        st.session_state.g_vals = {k: v for k, v in old_g.items() if k in locked}
+        st.session_state.t_vals = {k: v for k, v in old_t.items() if k in locked}
+        # Bump key counter so unlocked widgets get fresh instances
         st.session_state["_kctr"] = st.session_state.get("_kctr", 0) + 1
 
     doc = Document(io.BytesIO(file_bytes))
@@ -694,61 +698,93 @@ if uploaded_file is not None:
         st.warning("No `[placeholder]` fields found. Use square brackets, e.g. `[Name]`.")
         st.stop()
 
-    # ── Session state (reset on file change) ────────────────────────
-    if "g_vals" not in st.session_state:
-        st.session_state.g_vals = {ph: "" for ph in global_phs}
-    else:
+    # ── Locked fields persist across clear / file change ────────────
+    if "locked" not in st.session_state:
+        st.session_state.locked = set()
+
+    # ── Session state — preserve locked values on file change ────────
+    def _init_vals():
+        """Initialise g_vals / t_vals, keeping locked fields."""
+        locked = st.session_state.get("locked", set())
+        if "g_vals" not in st.session_state:
+            st.session_state.g_vals = {}
+        if "t_vals" not in st.session_state:
+            st.session_state.t_vals = {}
+        # Ensure every placeholder has an entry; keep locked values
         for ph in global_phs:
             if ph not in st.session_state.g_vals:
                 st.session_state.g_vals[ph] = ""
-
-    if "t_vals" not in st.session_state:
-        st.session_state.t_vals = {tf["name"]: "" for tf in table_fields}
-    else:
         for tf in table_fields:
             if tf["name"] not in st.session_state.t_vals:
                 st.session_state.t_vals[tf["name"]] = ""
 
-    kctr = st.session_state.get("_kctr", 0)  # widget key counter
+    _init_vals()
 
-    # ── Helper: clear all data ───────────────────────────────────────
-    def _clear_all():
-        st.session_state.g_vals = {ph: "" for ph in global_phs}
-        st.session_state.t_vals = {tf["name"]: "" for tf in table_fields}
+    kctr = st.session_state.get("_kctr", 0)  # widget-key generation counter
+
+    # ── Helper: clear unlocked fields ────────────────────────────────
+    def _clear_unlocked():
+        locked = st.session_state.get("locked", set())
+        for ph in global_phs:
+            if ph not in locked:
+                st.session_state.g_vals[ph] = ""
+        for tf in table_fields:
+            if tf["name"] not in locked:
+                st.session_state.t_vals[tf["name"]] = ""
         st.session_state["_kctr"] = st.session_state.get("_kctr", 0) + 1
 
-    # ── Helper: render input fields ──────────────────────────────────
+    # ── Helper: render one input row (field + lock toggle) ───────────
+    def _input_row(label, value, widget_key, placeholder="", multiline=False):
+        """Render an input field with a lock toggle. Returns (value, is_locked)."""
+        col_input, col_lock = st.columns([6, 1], vertical_alignment="bottom")
+        with col_input:
+            if multiline:
+                val = st.text_area(label, value=value, key=widget_key, height=80)
+            else:
+                val = st.text_input(label, value=value, key=widget_key,
+                                    placeholder=placeholder)
+        with col_lock:
+            is_locked = st.toggle(
+                "🔒", value=(label in st.session_state.locked),
+                key=f"lk_{kctr}_{label}",
+                help="Lock this field — it will survive Clear and new file uploads",
+            )
+        return val, is_locked
+
+    # ── Render all input fields ──────────────────────────────────────
     def _render_inputs():
         g = {}
         t = {}
+        new_locked = set()
 
         if global_phs:
             st.markdown("**Text Fields**")
             for ph in global_phs:
                 is_ml = any(kw in ph.lower() for kw in MULTILINE_KEYWORDS)
-                if is_ml:
-                    g[ph] = st.text_area(
-                        ph, value=st.session_state.g_vals.get(ph, ""),
-                        key=f"g_{kctr}_{ph}", height=80,
-                    )
-                else:
-                    g[ph] = st.text_input(
-                        ph, value=st.session_state.g_vals.get(ph, ""),
-                        key=f"g_{kctr}_{ph}",
-                    )
+                val, lk = _input_row(
+                    ph,
+                    st.session_state.g_vals.get(ph, ""),
+                    f"g_{kctr}_{ph}",
+                    multiline=is_ml,
+                )
+                g[ph] = val
+                if lk:
+                    new_locked.add(ph)
 
         if table_fields:
             st.markdown("**Numeric / Currency Fields** *(table)*")
             for tf in table_fields:
-                prefix_label = f" ({tf['prefix']})" if tf["prefix"] else ""
-                label = f"{tf['name']}{prefix_label}"
-                t[tf["name"]] = st.text_input(
-                    label,
-                    value=st.session_state.t_vals.get(tf["name"], ""),
-                    key=f"t_{kctr}_{tf['name']}",
+                val, lk = _input_row(
+                    tf["name"],
+                    st.session_state.t_vals.get(tf["name"], ""),
+                    f"t_{kctr}_{tf['name']}",
                     placeholder=f"{tf['prefix']}...",
                 )
+                t[tf["name"]] = val
+                if lk:
+                    new_locked.add(tf["name"])
 
+        st.session_state.locked = new_locked
         return g, t
 
     # ── Layout ───────────────────────────────────────────────────────
@@ -759,30 +795,29 @@ if uploaded_file is not None:
         total = len(global_phs) + len(table_fields)
         st.caption(f"{total} field(s) detected")
         g_vals, t_vals = _render_inputs()
+        # Sync live widget values back to session state
         st.session_state.g_vals.update(g_vals)
         st.session_state.t_vals.update(t_vals)
-        st.button("🗑️ Clear all fields", on_click=_clear_all, use_container_width=True)
+        st.button("🗑️ Clear unlocked fields", on_click=_clear_unlocked,
+                  use_container_width=True)
 
     with right_col:
         preview_on = st.toggle("Preview mode", value=False, key="pv_toggle",
                                help="Toggle to see the clean final version")
         mode = "preview" if preview_on else "edit"
         doc_html = render_document_html(
-            doc, mode, st.session_state.g_vals, global_lower,
-            table_fields, st.session_state.t_vals,
+            doc, mode, g_vals, global_lower, table_fields, t_vals,
         )
         st.components.v1.html(doc_html, height=900, scrolling=True)
 
-    # ── Downloads (generated on click, not eagerly) ──────────────────
+    # ── Downloads — always use the live widget values (g_vals, t_vals)
     st.markdown("---")
     st.markdown("#### Download")
     c1, c2, _ = st.columns([1, 1, 2])
 
     with c1:
         fresh = Document(io.BytesIO(file_bytes))
-        apply_replacements(
-            fresh, st.session_state.g_vals, st.session_state.t_vals, table_fields
-        )
+        apply_replacements(fresh, g_vals, t_vals, table_fields)
         buf = io.BytesIO()
         fresh.save(buf)
         st.download_button(
@@ -796,8 +831,7 @@ if uploaded_file is not None:
         if st.button("📄 Generate PDF", use_container_width=True):
             with st.spinner("Generating PDF..."):
                 pdf_bytes = generate_pdf(
-                    doc, st.session_state.g_vals, global_lower,
-                    table_fields, st.session_state.t_vals,
+                    doc, g_vals, global_lower, table_fields, t_vals,
                 )
             st.download_button(
                 "⬇️ Download PDF", data=pdf_bytes,
@@ -807,9 +841,13 @@ if uploaded_file is not None:
             )
 
 else:
-    # File cleared or not yet uploaded → wipe any previous data
-    for key in ("g_vals", "t_vals", "_file_fp"):
-        st.session_state.pop(key, None)
+    # File cleared or not yet uploaded → wipe unlocked data, keep locks
+    locked = st.session_state.get("locked", set())
+    old_g = st.session_state.get("g_vals", {})
+    old_t = st.session_state.get("t_vals", {})
+    st.session_state["g_vals"] = {k: v for k, v in old_g.items() if k in locked}
+    st.session_state["t_vals"] = {k: v for k, v in old_t.items() if k in locked}
+    st.session_state.pop("_file_fp", None)
 
     st.markdown("---")
     st.markdown("**How it works**")
