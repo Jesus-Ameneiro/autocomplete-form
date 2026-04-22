@@ -677,6 +677,16 @@ uploaded_file = st.file_uploader("Upload your Word template", type=["docx"])
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.read()
+
+    # ── Detect file change → clear all previous data ─────────────────
+    file_fingerprint = f"{uploaded_file.name}_{uploaded_file.size}"
+    if st.session_state.get("_file_fp") != file_fingerprint:
+        st.session_state["_file_fp"] = file_fingerprint
+        st.session_state.pop("g_vals", None)
+        st.session_state.pop("t_vals", None)
+        # Bump key counter so all input widgets get fresh instances
+        st.session_state["_kctr"] = st.session_state.get("_kctr", 0) + 1
+
     doc = Document(io.BytesIO(file_bytes))
     global_phs, global_lower, table_fields, table_text_cells = find_placeholders(doc)
 
@@ -684,7 +694,7 @@ if uploaded_file is not None:
         st.warning("No `[placeholder]` fields found. Use square brackets, e.g. `[Name]`.")
         st.stop()
 
-    # ── Session state ────────────────────────────────────────────────
+    # ── Session state (reset on file change) ────────────────────────
     if "g_vals" not in st.session_state:
         st.session_state.g_vals = {ph: "" for ph in global_phs}
     else:
@@ -699,9 +709,16 @@ if uploaded_file is not None:
             if tf["name"] not in st.session_state.t_vals:
                 st.session_state.t_vals[tf["name"]] = ""
 
+    kctr = st.session_state.get("_kctr", 0)  # widget key counter
+
+    # ── Helper: clear all data ───────────────────────────────────────
+    def _clear_all():
+        st.session_state.g_vals = {ph: "" for ph in global_phs}
+        st.session_state.t_vals = {tf["name"]: "" for tf in table_fields}
+        st.session_state["_kctr"] = st.session_state.get("_kctr", 0) + 1
+
     # ── Helper: render input fields ──────────────────────────────────
     def _render_inputs():
-        """Render all input fields. Returns (global_vals_dict, table_vals_dict)."""
         g = {}
         t = {}
 
@@ -712,12 +729,12 @@ if uploaded_file is not None:
                 if is_ml:
                     g[ph] = st.text_area(
                         ph, value=st.session_state.g_vals.get(ph, ""),
-                        key=f"doc_g_{ph}", height=80,
+                        key=f"g_{kctr}_{ph}", height=80,
                     )
                 else:
                     g[ph] = st.text_input(
                         ph, value=st.session_state.g_vals.get(ph, ""),
-                        key=f"doc_g_{ph}",
+                        key=f"g_{kctr}_{ph}",
                     )
 
         if table_fields:
@@ -728,7 +745,7 @@ if uploaded_file is not None:
                 t[tf["name"]] = st.text_input(
                     label,
                     value=st.session_state.t_vals.get(tf["name"], ""),
-                    key=f"doc_t_{tf['name']}",
+                    key=f"t_{kctr}_{tf['name']}",
                     placeholder=f"{tf['prefix']}...",
                 )
 
@@ -744,6 +761,7 @@ if uploaded_file is not None:
         g_vals, t_vals = _render_inputs()
         st.session_state.g_vals.update(g_vals)
         st.session_state.t_vals.update(t_vals)
+        st.button("🗑️ Clear all fields", on_click=_clear_all, use_container_width=True)
 
     with right_col:
         preview_on = st.toggle("Preview mode", value=False, key="pv_toggle",
@@ -789,6 +807,10 @@ if uploaded_file is not None:
             )
 
 else:
+    # File cleared or not yet uploaded → wipe any previous data
+    for key in ("g_vals", "t_vals", "_file_fp"):
+        st.session_state.pop(key, None)
+
     st.markdown("---")
     st.markdown("**How it works**")
     st.markdown(
