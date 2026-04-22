@@ -226,7 +226,7 @@ def render_list_html(items, mode, values, lower_map):
     return "<ul>" + "".join(lis) + "</ul>"
 
 
-def render_document_html(doc, mode, values, lower_map, for_pdf=False):
+def render_document_html(doc, mode, values, lower_map):
     """
     Render the full document as styled HTML.
     mode: 'edit' | 'preview' | 'blank'
@@ -242,11 +242,7 @@ def render_document_html(doc, mode, values, lower_map, for_pdf=False):
             parts.append(render_list_html(el["items"], mode, values, lower_map))
 
     body_html = "\n".join(parts)
-
-    if for_pdf:
-        css = _get_pdf_css()
-    else:
-        css = _get_display_css(mode)
+    css = _get_display_css(mode)
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>{css}</style></head>
@@ -300,26 +296,6 @@ def _get_display_css(mode):
     }
     """
 
-
-def _get_pdf_css():
-    return """
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-        font-family: Helvetica, Arial, sans-serif;
-        font-size: 11pt; color: #1a1a1a;
-    }
-    .doc-page { padding: 20px 0; }
-    p { margin: 6px 0; line-height: 1.5; }
-    ul { margin: 8px 0 8px 28px; }
-    li { margin: 4px 0; line-height: 1.5; }
-    .doc-table {
-        width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 10pt;
-    }
-    .doc-table th, .doc-table td {
-        border: 1px solid #999; padding: 6px 10px; text-align: left;
-    }
-    .doc-table th { background: #f0f0f0; font-weight: bold; }
-    """
 
 
 # ─── Placeholder Discovery ──────────────────────────────────────────────────
@@ -400,14 +376,112 @@ def apply_replacements(doc, replacements):
         _replace_in_paragraph(para, repl_lower)
 
 
-# ─── PDF Generation via xhtml2pdf ───────────────────────────────────────────
+# ─── PDF Generation via fpdf2 (pure Python, no native deps) ─────────────────
 
 def generate_pdf(doc, values, lower_map):
-    """Generate PDF bytes from the document with values applied."""
-    html_str = render_document_html(doc, "preview", values, lower_map, for_pdf=True)
-    from xhtml2pdf import pisa
+    """Generate PDF bytes from the document with filled values using fpdf2."""
+    from fpdf import FPDF
+    import os
+
+    pdf = FPDF(orientation="P", unit="mm", format="Letter")
+    pdf.set_auto_page_break(auto=True, margin=20)
+
+    # Register a Unicode TTF font (DejaVu Sans ships with most Linux distros
+    # and is available on Streamlit Cloud's Debian base image)
+    font_dir = "/usr/share/fonts/truetype/dejavu"
+    font_name = "DejaVu"
+    if os.path.isfile(os.path.join(font_dir, "DejaVuSans.ttf")):
+        pdf.add_font(font_name, "", os.path.join(font_dir, "DejaVuSans.ttf"))
+        pdf.add_font(font_name, "B", os.path.join(font_dir, "DejaVuSans-Bold.ttf"))
+        pdf.add_font(font_name, "I", os.path.join(font_dir, "DejaVuSans-Oblique.ttf"))
+        pdf.add_font(font_name, "BI", os.path.join(font_dir, "DejaVuSans-BoldOblique.ttf"))
+    else:
+        # Fallback: Helvetica (ASCII only, accented chars will be lossy)
+        font_name = "Helvetica"
+
+    pdf.add_page()
+    pdf.set_margins(18, 18, 18)
+    pdf.set_font(font_name, size=11)
+
+    def _resolve(text):
+        """Replace [placeholder] tokens in a text string."""
+        def _sub(m):
+            key = m.group(1).strip().lower()
+            display = lower_map.get(key, m.group(1).strip())
+            val = values.get(display, "")
+            return val if val.strip() else m.group(0)
+        return PLACEHOLDER_RE.sub(_sub, text)
+
+    elements = parse_document(doc)
+
+    for el in elements:
+        if el["type"] == "paragraph":
+            para = el["para"]
+            runs = para.runs
+            full_text = "".join(r.text for r in runs)
+            resolved = _resolve(full_text)
+
+            if not resolved.strip():
+                pdf.ln(4)
+                continue
+
+            # Determine alignment
+            align = _get_alignment(para)
+            align_map = {"left": "L", "right": "R", "center": "C", "justify": "J"}
+            pdf_align = align_map.get(align, "L")
+
+            # Determine font size from first run
+            font_size = 11
+            if runs and runs[0].font and runs[0].font.size:
+                font_size = round(runs[0].font.size / 12700)
+
+            # Check if entire paragraph is bold
+            is_bold = all(r.bold for r in runs if r.text.strip()) if runs else False
+            style = "B" if is_bold else ""
+
+            pdf.set_font(font_name, style=style, size=font_size)
+            pdf.multi_cell(0, font_size * 0.45, resolved, align=pdf_align)
+            pdf.ln(1)
+
+        elif el["type"] == "table":
+            table = el["table"]
+            num_cols = len(table.rows[0].cells) if table.rows else 0
+            if num_cols == 0:
+                continue
+            col_width = (pdf.w - pdf.l_margin - pdf.r_margin) / num_cols
+
+            for ri, row in enumerate(table.rows):
+                is_header = ri == 0
+                pdf.set_font(font_name, "B" if is_header else "", 9)
+                row_height = 7
+                for ci, cell in enumerate(row.cells):
+                    cell_text = _resolve(cell.text)
+                    x_before = pdf.get_x()
+                    y_before = pdf.get_y()
+                    pdf.rect(x_before, y_before, col_width, row_height)
+                    if is_header:
+                        pdf.set_fill_color(235, 235, 235)
+                        pdf.rect(x_before, y_before, col_width, row_height, "F")
+                    pdf.set_xy(x_before + 1, y_before + 1)
+                    pdf.cell(col_width - 2, row_height - 2, cell_text, align="L")
+                    pdf.set_xy(x_before + col_width, y_before)
+                pdf.ln(row_height)
+            pdf.ln(2)
+
+        elif el["type"] == "list":
+            for para in el["items"]:
+                full_text = "".join(r.text for r in para.runs)
+                resolved = _resolve(full_text)
+                is_bold = any(r.bold for r in para.runs if r.text.strip())
+
+                pdf.set_font(font_name, "", 11)
+                pdf.cell(8, 5, "\u2022", align="R")  # bullet
+                pdf.set_font(font_name, "B" if is_bold else "", 11)
+                pdf.multi_cell(0, 5, " " + resolved, align="J")
+                pdf.ln(1)
+
     buf = io.BytesIO()
-    pisa.CreatePDF(io.StringIO(html_str), dest=buf)
+    pdf.output(buf)
     buf.seek(0)
     return buf.getvalue()
 
