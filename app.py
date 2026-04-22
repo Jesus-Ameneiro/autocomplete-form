@@ -6,7 +6,7 @@ Document View with live inline preview.
 Exports to DOCX and PDF.
 """
 
-import re, io, os, html as html_mod
+import re, io, os, html as html_mod, base64
 import streamlit as st
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -667,7 +667,34 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📝 Template Document Filler")
+# ── User Guide (PDF opens in new tab) ────────────────────────────────────
+
+_GUIDE_PATH = os.path.join(os.path.dirname(__file__), "user_guide.pdf")
+
+@st.cache_data
+def _load_guide_b64():
+    if os.path.isfile(_GUIDE_PATH):
+        with open(_GUIDE_PATH, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    return None
+
+_guide_b64 = _load_guide_b64()
+
+_title_col, _guide_col = st.columns([5, 1])
+with _title_col:
+    st.title("📝 Template Document Filler")
+with _guide_col:
+    if _guide_b64:
+        st.markdown(
+            f'<a href="data:application/pdf;base64,{_guide_b64}" '
+            f'target="_blank" style="text-decoration:none;">'
+            f'<div style="background:#E8610C;color:white;padding:8px 12px;'
+            f'border-radius:6px;text-align:center;font-size:0.85em;'
+            f'font-weight:600;margin-top:12px;cursor:pointer;">'
+            f'📖 User Guide</div></a>',
+            unsafe_allow_html=True,
+        )
+
 st.caption(
     "Upload a `.docx` template with `[placeholder]` fields. "
     "Fill in the values and export as DOCX or PDF."
