@@ -685,15 +685,27 @@ with _title_col:
     st.title("📝 Template Document Filler")
 with _guide_col:
     if _guide_b64:
-        st.markdown(
-            f'<a href="data:application/pdf;base64,{_guide_b64}" '
-            f'target="_blank" style="text-decoration:none;">'
-            f'<div style="background:#E8610C;color:white;padding:8px 12px;'
-            f'border-radius:6px;text-align:center;font-size:0.85em;'
-            f'font-weight:600;margin-top:12px;cursor:pointer;">'
-            f'📖 User Guide</div></a>',
-            unsafe_allow_html=True,
-        )
+        # Use st.components.v1.html with JS Blob — st.markdown sanitises
+        # large data-URIs, so we build a Blob URL in the browser instead.
+        _btn_html = f"""
+        <button onclick="openGuide()" style="
+            background:#E8610C;color:white;padding:8px 14px;border:none;
+            border-radius:6px;font-size:0.85em;font-weight:600;
+            cursor:pointer;margin-top:8px;width:100%;
+        ">📖 User Guide</button>
+        <script>
+        function openGuide() {{
+            var b64 = "{_guide_b64}";
+            var bin = atob(b64);
+            var len = bin.length;
+            var bytes = new Uint8Array(len);
+            for (var i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+            var blob = new Blob([bytes], {{type: "application/pdf"}});
+            window.open(URL.createObjectURL(blob), "_blank");
+        }}
+        </script>
+        """
+        st.components.v1.html(_btn_html, height=50)
 
 st.caption(
     "Upload a `.docx` template with `[placeholder]` fields. "
