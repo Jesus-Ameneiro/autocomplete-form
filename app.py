@@ -1,6 +1,6 @@
 """
 Template Document Filler — Streamlit App (v3)
-Two modes: Document View (live inline preview) and Form View.
+Document View with live inline preview.
 - Text placeholders are global (shared across all occurrences).
 - Numeric/currency placeholders in tables are independent, named by Header_Row.
 Exports to DOCX and PDF.
@@ -511,15 +511,56 @@ def generate_pdf(doc, global_values, global_lower, table_fields, table_field_val
     pdf = FPDF(orientation="P", unit="mm", format="Letter")
     pdf.set_auto_page_break(auto=True, margin=20)
 
-    font_dir = "/usr/share/fonts/truetype/dejavu"
-    fn = "DejaVu"
-    if os.path.isfile(os.path.join(font_dir, "DejaVuSans.ttf")):
-        pdf.add_font(fn, "", os.path.join(font_dir, "DejaVuSans.ttf"))
-        pdf.add_font(fn, "B", os.path.join(font_dir, "DejaVuSans-Bold.ttf"))
-        pdf.add_font(fn, "I", os.path.join(font_dir, "DejaVuSans-Oblique.ttf"))
-        pdf.add_font(fn, "BI", os.path.join(font_dir, "DejaVuSans-BoldOblique.ttf"))
+    # Try to find a Unicode TTF font; search several common paths
+    fn = "Helvetica"  # safe fallback (ASCII only)
+    search_dirs = [
+        "/usr/share/fonts/truetype/dejavu",
+        "/usr/share/fonts/truetype/liberation",
+        "/usr/share/fonts/TTF",
+        "/usr/local/share/fonts",
+    ]
+    font_variants = {
+        "dejavu": {
+            "": "DejaVuSans.ttf",
+            "B": "DejaVuSans-Bold.ttf",
+            "I": "DejaVuSans-Oblique.ttf",
+            "BI": "DejaVuSans-BoldOblique.ttf",
+        },
+        "liberation": {
+            "": "LiberationSans-Regular.ttf",
+            "B": "LiberationSans-Bold.ttf",
+            "I": "LiberationSans-Italic.ttf",
+            "BI": "LiberationSans-BoldItalic.ttf",
+        },
+    }
+
+    font_loaded = False
+    for fdir in search_dirs:
+        if not os.path.isdir(fdir):
+            continue
+        for family_name, variants in font_variants.items():
+            regular = os.path.join(fdir, variants[""])
+            if not os.path.isfile(regular):
+                continue
+            try:
+                fn = family_name
+                pdf.add_font(fn, "", regular)
+                # Add bold/italic only if the files actually exist
+                for style_key in ("B", "I", "BI"):
+                    path = os.path.join(fdir, variants[style_key])
+                    if os.path.isfile(path):
+                        pdf.add_font(fn, style_key, path)
+                font_loaded = True
+                break
+            except Exception:
+                fn = "Helvetica"
+                continue
+        if font_loaded:
+            break
     else:
         fn = "Helvetica"
+
+    bullet_char = "\u2022" if font_loaded else "-"
 
     pdf.add_page()
     pdf.set_margins(18, 18, 18)
@@ -599,7 +640,7 @@ def generate_pdf(doc, global_values, global_lower, table_fields, table_field_val
                 full_text = "".join(r.text for r in para.runs)
                 resolved = _resolve_global(full_text)
                 pdf.set_font(fn, "", 11)
-                pdf.cell(8, 5, "\u2022", align="R")
+                pdf.cell(8, 5, bullet_char, align="R")
                 pdf.set_font(fn, "", 11)
                 pdf.multi_cell(0, 5, " " + resolved, align="J")
                 pdf.ln(1)
@@ -623,11 +664,6 @@ st.markdown("""
         padding: 2px 8px; border-radius: 4px; font-family: monospace;
         font-size: 0.82em; margin: 2px;
     }
-    .placeholder-tag.numeric {
-        background: #e8f8e8; color: #1a6b1a;
-    }
-    .stTabs [data-baseweb="tab-list"] { gap: 4px; }
-    .stTabs [data-baseweb="tab"] { padding: 8px 20px; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -664,7 +700,7 @@ if uploaded_file is not None:
                 st.session_state.t_vals[tf["name"]] = ""
 
     # ── Helper: render input fields ──────────────────────────────────
-    def _render_inputs(key_prefix):
+    def _render_inputs():
         """Render all input fields. Returns (global_vals_dict, table_vals_dict)."""
         g = {}
         t = {}
@@ -676,12 +712,12 @@ if uploaded_file is not None:
                 if is_ml:
                     g[ph] = st.text_area(
                         ph, value=st.session_state.g_vals.get(ph, ""),
-                        key=f"{key_prefix}_g_{ph}", height=80,
+                        key=f"doc_g_{ph}", height=80,
                     )
                 else:
                     g[ph] = st.text_input(
                         ph, value=st.session_state.g_vals.get(ph, ""),
-                        key=f"{key_prefix}_g_{ph}",
+                        key=f"doc_g_{ph}",
                     )
 
         if table_fields:
@@ -692,127 +728,65 @@ if uploaded_file is not None:
                 t[tf["name"]] = st.text_input(
                     label,
                     value=st.session_state.t_vals.get(tf["name"], ""),
-                    key=f"{key_prefix}_t_{tf['name']}",
+                    key=f"doc_t_{tf['name']}",
                     placeholder=f"{tf['prefix']}...",
                 )
 
         return g, t
 
-    # ── Helper: download buttons ─────────────────────────────────────
-    def _download_buttons(g_vals, t_vals, key_suffix=""):
-        c1, c2, _ = st.columns([1, 1, 2])
-        with c1:
-            fresh = Document(io.BytesIO(file_bytes))
-            apply_replacements(fresh, g_vals, t_vals, table_fields)
-            buf = io.BytesIO()
-            fresh.save(buf)
-            st.download_button(
-                "⬇️ Download DOCX", data=buf.getvalue(),
-                file_name=uploaded_file.name.replace(".docx", "_filled.docx"),
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True, key=f"dl_docx{key_suffix}",
-            )
-        with c2:
-            pdf_bytes = generate_pdf(doc, g_vals, global_lower, table_fields, t_vals)
+    # ── Layout ───────────────────────────────────────────────────────
+    left_col, right_col = st.columns([1, 2], gap="large")
+
+    with left_col:
+        st.markdown("#### Fields")
+        total = len(global_phs) + len(table_fields)
+        st.caption(f"{total} field(s) detected")
+        g_vals, t_vals = _render_inputs()
+        st.session_state.g_vals.update(g_vals)
+        st.session_state.t_vals.update(t_vals)
+
+    with right_col:
+        preview_on = st.toggle("Preview mode", value=False, key="pv_toggle",
+                               help="Toggle to see the clean final version")
+        mode = "preview" if preview_on else "edit"
+        doc_html = render_document_html(
+            doc, mode, st.session_state.g_vals, global_lower,
+            table_fields, st.session_state.t_vals,
+        )
+        st.components.v1.html(doc_html, height=900, scrolling=True)
+
+    # ── Downloads (generated on click, not eagerly) ──────────────────
+    st.markdown("---")
+    st.markdown("#### Download")
+    c1, c2, _ = st.columns([1, 1, 2])
+
+    with c1:
+        fresh = Document(io.BytesIO(file_bytes))
+        apply_replacements(
+            fresh, st.session_state.g_vals, st.session_state.t_vals, table_fields
+        )
+        buf = io.BytesIO()
+        fresh.save(buf)
+        st.download_button(
+            "⬇️ Download DOCX", data=buf.getvalue(),
+            file_name=uploaded_file.name.replace(".docx", "_filled.docx"),
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
+
+    with c2:
+        if st.button("📄 Generate PDF", use_container_width=True):
+            with st.spinner("Generating PDF..."):
+                pdf_bytes = generate_pdf(
+                    doc, st.session_state.g_vals, global_lower,
+                    table_fields, st.session_state.t_vals,
+                )
             st.download_button(
                 "⬇️ Download PDF", data=pdf_bytes,
                 file_name=uploaded_file.name.replace(".docx", "_filled.pdf"),
                 mime="application/pdf",
-                use_container_width=True, key=f"dl_pdf{key_suffix}",
+                use_container_width=True, key="dl_pdf_ready",
             )
-
-    # ── Tabs ─────────────────────────────────────────────────────────
-    tab_doc, tab_form = st.tabs(["📄 Document View", "📋 Form View"])
-
-    # ═══════ TAB 1 — Document View ═══════════════════════════════════
-    with tab_doc:
-        left_col, right_col = st.columns([1, 2], gap="large")
-
-        with left_col:
-            st.markdown("#### Fields")
-            total = len(global_phs) + len(table_fields)
-            st.caption(f"{total} field(s) detected")
-            g_vals, t_vals = _render_inputs("doc")
-            st.session_state.g_vals.update(g_vals)
-            st.session_state.t_vals.update(t_vals)
-
-        with right_col:
-            preview_on = st.toggle("Preview mode", value=False, key="pv_toggle",
-                                   help="Toggle to see the clean final version")
-            mode = "preview" if preview_on else "edit"
-            doc_html = render_document_html(
-                doc, mode, st.session_state.g_vals, global_lower,
-                table_fields, st.session_state.t_vals,
-            )
-            st.components.v1.html(doc_html, height=900, scrolling=True)
-
-        st.markdown("---")
-        st.markdown("#### Download")
-        _download_buttons(st.session_state.g_vals, st.session_state.t_vals, "_dv")
-
-    # ═══════ TAB 2 — Form View ═══════════════════════════════════════
-    with tab_form:
-        # Show detected placeholders as tags
-        st.markdown("#### Detected placeholders")
-        tags = " ".join(
-            f'<span class="placeholder-tag">[{ph}]</span>' for ph in global_phs
-        )
-        tags += " ".join(
-            f'<span class="placeholder-tag numeric">{tf["prefix"]}{tf["name"]}</span>'
-            for tf in table_fields
-        )
-        st.markdown(tags, unsafe_allow_html=True)
-        st.markdown("")
-
-        st.subheader("Fill in the fields")
-
-        with st.form("template_form"):
-            form_g = {}
-            form_t = {}
-
-            if global_phs:
-                st.markdown("**Text Fields**")
-                for ph in global_phs:
-                    is_ml = any(kw in ph.lower() for kw in MULTILINE_KEYWORDS)
-                    default = st.session_state.g_vals.get(ph, "")
-                    if is_ml:
-                        form_g[ph] = st.text_area(ph, value=default, key=f"fm_g_{ph}", height=80)
-                    else:
-                        form_g[ph] = st.text_input(ph, value=default, key=f"fm_g_{ph}")
-
-            if table_fields:
-                st.markdown("**Numeric / Currency Fields** *(table)*")
-                for tf in table_fields:
-                    prefix_label = f" ({tf['prefix']})" if tf["prefix"] else ""
-                    label = f"{tf['name']}{prefix_label}"
-                    default = st.session_state.t_vals.get(tf["name"], "")
-                    form_t[tf["name"]] = st.text_input(
-                        label, value=default, key=f"fm_t_{tf['name']}",
-                        placeholder=f"{tf['prefix']}...",
-                    )
-
-            submitted = st.form_submit_button(
-                "Generate Document", type="primary", use_container_width=True
-            )
-
-        if submitted:
-            st.session_state.g_vals.update(form_g)
-            st.session_state.t_vals.update(form_t)
-
-            empty_g = [k for k, v in form_g.items() if not v.strip()]
-            empty_t = [k for k, v in form_t.items() if not v.strip()]
-            total_empty = len(empty_g) + len(empty_t)
-            if total_empty:
-                st.warning(f"**{total_empty}** field(s) left empty.")
-
-            with st.expander("📖 Preview", expanded=True):
-                preview_html = render_document_html(
-                    doc, "preview", form_g, global_lower, table_fields, form_t,
-                )
-                st.components.v1.html(preview_html, height=800, scrolling=True)
-
-            st.markdown("#### Download")
-            _download_buttons(form_g, form_t, "_fm")
 
 else:
     st.markdown("---")
