@@ -119,31 +119,34 @@ def find_placeholders(doc):
       table_text_cells: list of (table_idx, row_idx, col_idx, placeholder_name)
                         for text placeholders in tables (use global values)
     """
-    # --- Pass 1: body + header/footer paragraphs → global text placeholders ---
+    # --- Pass 1: body + header/footer paragraphs → global placeholders ---
+    #     ALL types (text, currency, numeric) become global when in the body.
+    #     Currency/numeric are only independent when inside TABLE cells.
     seen_lower = {}
     order = []
+    body_prefixes = {}  # placeholder name → currency prefix (e.g. "$")
 
-    def _add_global(name):
+    def _add_global(name, prefix=""):
         key = name.lower()
         if key not in seen_lower:
             seen_lower[key] = name
             order.append(name)
+        if prefix:
+            body_prefixes[name] = prefix
 
     for para in _iter_body_paragraphs(doc):
         full_text = "".join(r.text for r in para.runs)
         for m in PLACEHOLDER_RE.finditer(full_text):
             raw = m.group(1).strip()
             ptype, prefix, label = _classify_placeholder(raw)
-            if ptype == "text":
-                _add_global(raw)
+            _add_global(raw, prefix)
 
     for para in _iter_header_footer_paragraphs(doc):
         full_text = "".join(r.text for r in para.runs)
         for m in PLACEHOLDER_RE.finditer(full_text):
             raw = m.group(1).strip()
-            ptype, _, _ = _classify_placeholder(raw)
-            if ptype == "text":
-                _add_global(raw)
+            ptype, prefix, _ = _classify_placeholder(raw)
+            _add_global(raw, prefix)
 
     # --- Pass 2: tables → classify each cell's placeholder ---
     table_fields = []
@@ -184,7 +187,7 @@ def find_placeholders(doc):
                     _add_global(raw)
                     table_text_cells.append((ti, ri, ci, raw))
 
-    return order, seen_lower, table_fields, table_text_cells
+    return order, seen_lower, table_fields, table_text_cells, body_prefixes
 
 
 # ─── Run-aware replacement helpers ──────────────────────────────────────────
@@ -234,13 +237,21 @@ def _replace_cell(cell, value):
             r.text = ""
 
 
-def apply_replacements(doc, global_values, table_field_values, table_fields):
+def apply_replacements(doc, global_values, table_field_values, table_fields,
+                       body_prefixes=None):
     """
     Replace placeholders in the document:
-    - Body/header/footer: use global_values (case-insensitive)
-    - Table numeric/currency cells: use table_field_values with prefix
+    - Body/header/footer: use global_values (case-insensitive).
+      For body currency fields, the prefix is prepended automatically.
+    - Table numeric/currency cells: use table_field_values with prefix.
     """
-    repl_lower = {k.lower(): v for k, v in global_values.items()}
+    bp = body_prefixes or {}
+    repl_lower = {}
+    for k, v in global_values.items():
+        if not v.strip():
+            continue
+        prefix = bp.get(k, "")
+        repl_lower[k.lower()] = prefix + v
 
     # Body + header/footer paragraphs (global)
     for para in _iter_body_paragraphs(doc):
@@ -408,10 +419,77 @@ def parse_document(doc):
     return elements
 
 
+# ─── Extract images from headers / footers / body ───────────────────────
+
+_BLIP_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def _extract_images(doc):
+    """
+    Extract header and footer images as base64 data-URIs.
+    Returns {'header_images': [data_uri, ...], 'footer_images': [...]}.
+    """
+    result = {"header_images": [], "footer_images": []}
+    for section in doc.sections:
+        for key, hf in [("header_images", section.header),
+                         ("footer_images", section.footer)]:
+            if hf is None or hf.is_linked_to_previous:
+                continue
+            for para in hf.paragraphs:
+                for run in para.runs:
+                    blips = run._element.findall(f".//{{{_BLIP_NS}}}blip")
+                    for blip in blips:
+                        embed_id = blip.get(f"{{{_REL_NS}}}embed")
+                        if not embed_id:
+                            continue
+                        try:
+                            rel = hf.part.rels[embed_id]
+                            img_bytes = rel.target_part.blob
+                            ct = rel.target_part.content_type or "image/png"
+                            b64 = base64.b64encode(img_bytes).decode()
+                            result[key].append(f"data:{ct};base64,{b64}")
+                        except Exception:
+                            pass
+    return result
+
+
+def _extract_header_image_bytes(doc):
+    """Return (image_bytes, content_type) for the first header image, or (None, None)."""
+    for section in doc.sections:
+        hdr = section.header
+        if hdr is None or hdr.is_linked_to_previous:
+            continue
+        for para in hdr.paragraphs:
+            for run in para.runs:
+                blips = run._element.findall(f".//{{{_BLIP_NS}}}blip")
+                for blip in blips:
+                    embed_id = blip.get(f"{{{_REL_NS}}}embed")
+                    if not embed_id:
+                        continue
+                    try:
+                        rel = hdr.part.rels[embed_id]
+                        return rel.target_part.blob, rel.target_part.content_type
+                    except Exception:
+                        pass
+    return None, None
+
+
 # ─── Full Document HTML Rendering ───────────────────────────────────────────
 
-def render_document_html(doc, mode, global_values, global_lower, table_fields, table_field_values):
+def render_document_html(doc, mode, global_values, global_lower, table_fields,
+                         table_field_values, body_prefixes=None):
     """Render the full document as styled HTML."""
+
+    # Apply body prefixes to a copy of global_values for display
+    bp = body_prefixes or {}
+    display_vals = {}
+    for k, v in global_values.items():
+        prefix = bp.get(k, "")
+        display_vals[k] = (prefix + v) if v.strip() else v
+
+    # Extract header/footer images
+    images = _extract_images(doc)
 
     # Build (table_element_id, row_idx, col_idx) → table_field mapping
     tf_map = {}
@@ -421,7 +499,16 @@ def render_document_html(doc, mode, global_values, global_lower, table_fields, t
         tf_map[key] = tf
 
     elements = parse_document(doc)
+
+    # Header images
     parts = []
+    if images["header_images"]:
+        hdr_imgs = "".join(
+            f'<img src="{uri}" class="doc-header-img" />'
+            for uri in images["header_images"]
+        )
+        parts.append(f'<div class="doc-header">{hdr_imgs}</div>')
+        parts.append('<hr class="doc-header-rule" />')
 
     for el in elements:
         if el["type"] == "paragraph":
@@ -431,7 +518,7 @@ def render_document_html(doc, mode, global_values, global_lower, table_fields, t
             if not runs:
                 parts.append(f'<p style="text-align:{align};margin:4px 0">&nbsp;</p>')
                 continue
-            inner = render_runs_html(runs, mode, global_values, global_lower)
+            inner = render_runs_html(runs, mode, display_vals, global_lower)
             if not inner.strip():
                 inner = "&nbsp;"
             parts.append(f'<p style="text-align:{align};margin:6px 0;line-height:1.5">{inner}</p>')
@@ -445,7 +532,7 @@ def render_document_html(doc, mode, global_values, global_lower, table_fields, t
                 for ci, cell in enumerate(row.cells):
                     cell_key = (tbl_id, ri, ci)
                     inner = _render_table_cell_html(
-                        cell, cell_key, mode, global_values, global_lower,
+                        cell, cell_key, mode, display_vals, global_lower,
                         tf_map, table_field_values,
                     )
                     tag = "th" if ri == 0 else "td"
@@ -456,15 +543,25 @@ def render_document_html(doc, mode, global_values, global_lower, table_fields, t
         elif el["type"] == "list":
             lis = []
             for para in el["items"]:
-                inner = render_runs_html(para.runs, mode, global_values, global_lower)
+                inner = render_runs_html(para.runs, mode, display_vals, global_lower)
                 lis.append(f"<li>{inner}</li>")
             parts.append("<ul>" + "".join(lis) + "</ul>")
 
     body_html = "\n".join(parts)
+
+    # Footer images
+    footer_html = ""
+    if images["footer_images"]:
+        ftr_imgs = "".join(
+            f'<img src="{uri}" class="doc-footer-img" />'
+            for uri in images["footer_images"]
+        )
+        footer_html = f'<hr class="doc-footer-rule" /><div class="doc-footer">{ftr_imgs}</div>'
+
     css = _get_display_css()
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>{css}</style></head>
-<body><div class="doc-page">{body_html}</div></body></html>"""
+<body><div class="doc-page">{body_html}{footer_html}</div></body></html>"""
 
 
 def _get_display_css():
@@ -500,12 +597,19 @@ def _get_display_css():
         padding: 1px 5px; border-radius: 3px;
         border: 1px dashed #ffc107; font-style: italic; font-size: 0.92em;
     }
+    .doc-header { text-align: left; margin-bottom: 8px; }
+    .doc-header-img { max-width: 200px; max-height: 80px; object-fit: contain; }
+    .doc-header-rule { border: none; border-top: 1px solid #ccc; margin: 4px 0 12px; }
+    .doc-footer { text-align: center; margin-top: 8px; }
+    .doc-footer-img { max-width: 200px; max-height: 80px; object-fit: contain; }
+    .doc-footer-rule { border: none; border-top: 1px solid #ccc; margin: 16px 0 4px; }
     """
 
 
 # ─── PDF Generation via fpdf2 ───────────────────────────────────────────────
 
-def generate_pdf(doc, global_values, global_lower, table_fields, table_field_values):
+def generate_pdf(doc, global_values, global_lower, table_fields, table_field_values,
+                 body_prefixes=None):
     from fpdf import FPDF
 
     pdf = FPDF(orientation="P", unit="mm", format="Letter")
@@ -562,12 +666,37 @@ def generate_pdf(doc, global_values, global_lower, table_fields, table_field_val
 
     bullet_char = "\u2022" if font_loaded else "-"
 
+    # Extract header image for the PDF
+    hdr_img_bytes, hdr_img_ct = _extract_header_image_bytes(doc)
+    _tmp_img_path = None
+    if hdr_img_bytes:
+        import tempfile
+        ext = ".png" if "png" in (hdr_img_ct or "") else ".jpg"
+        _tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+        _tmp.write(hdr_img_bytes)
+        _tmp.close()
+        _tmp_img_path = _tmp.name
+
     pdf.add_page()
     pdf.set_margins(18, 18, 18)
+
+    # Render header image
+    if _tmp_img_path:
+        try:
+            pdf.image(_tmp_img_path, x=18, y=14, w=50)
+            pdf.ln(18)
+        except Exception:
+            pass
+
     pdf.set_font(fn, size=11)
 
-    # Build global replacement dict
-    repl_lower = {k.lower(): v for k, v in global_values.items()}
+    # Build global replacement dict with body prefixes applied
+    bp = body_prefixes or {}
+    repl_lower = {}
+    for k, v in global_values.items():
+        if v.strip():
+            prefix = bp.get(k, "")
+            repl_lower[k.lower()] = prefix + v
 
     # Build table field lookup: (table_idx, row_idx, col_idx) → (prefix, value)
     tf_lookup = {}
@@ -578,9 +707,9 @@ def generate_pdf(doc, global_values, global_lower, table_fields, table_field_val
     def _resolve_global(text):
         def _sub(m):
             key = m.group(1).strip().lower()
-            display = global_lower.get(key, m.group(1).strip())
-            val = global_values.get(display, "")
-            return val if val.strip() else m.group(0)
+            if key in repl_lower:
+                return repl_lower[key]
+            return m.group(0)
         return PLACEHOLDER_RE.sub(_sub, text)
 
     elements = parse_document(doc)
@@ -648,6 +777,14 @@ def generate_pdf(doc, global_values, global_lower, table_fields, table_field_val
     buf = io.BytesIO()
     pdf.output(buf)
     buf.seek(0)
+
+    # Clean up temp image file
+    if _tmp_img_path:
+        try:
+            os.unlink(_tmp_img_path)
+        except Exception:
+            pass
+
     return buf.getvalue()
 
 
@@ -731,7 +868,7 @@ if uploaded_file is not None:
         st.session_state["_kctr"] = st.session_state.get("_kctr", 0) + 1
 
     doc = Document(io.BytesIO(file_bytes))
-    global_phs, global_lower, table_fields, table_text_cells = find_placeholders(doc)
+    global_phs, global_lower, table_fields, table_text_cells, body_prefixes = find_placeholders(doc)
 
     if not global_phs and not table_fields:
         st.warning("No `[placeholder]` fields found. Use square brackets, e.g. `[Name]`.")
@@ -800,11 +937,14 @@ if uploaded_file is not None:
             st.markdown("**Text Fields**")
             for ph in global_phs:
                 is_ml = any(kw in ph.lower() for kw in MULTILINE_KEYWORDS)
+                prefix = body_prefixes.get(ph, "")
+                display_label = f"{ph} ({prefix})" if prefix else ph
                 val, lk = _input_row(
                     ph,
                     st.session_state.g_vals.get(ph, ""),
                     f"g_{kctr}_{ph}",
                     multiline=is_ml,
+                    placeholder=f"{prefix}..." if prefix else "",
                 )
                 g[ph] = val
                 if lk:
@@ -846,6 +986,7 @@ if uploaded_file is not None:
         mode = "preview" if preview_on else "edit"
         doc_html = render_document_html(
             doc, mode, g_vals, global_lower, table_fields, t_vals,
+            body_prefixes,
         )
         st.components.v1.html(doc_html, height=900, scrolling=True)
 
@@ -856,7 +997,7 @@ if uploaded_file is not None:
 
     with c1:
         fresh = Document(io.BytesIO(file_bytes))
-        apply_replacements(fresh, g_vals, t_vals, table_fields)
+        apply_replacements(fresh, g_vals, t_vals, table_fields, body_prefixes)
         buf = io.BytesIO()
         fresh.save(buf)
         st.download_button(
@@ -871,6 +1012,7 @@ if uploaded_file is not None:
             with st.spinner("Generating PDF..."):
                 pdf_bytes = generate_pdf(
                     doc, g_vals, global_lower, table_fields, t_vals,
+                    body_prefixes,
                 )
             st.download_button(
                 "⬇️ Download PDF", data=pdf_bytes,
